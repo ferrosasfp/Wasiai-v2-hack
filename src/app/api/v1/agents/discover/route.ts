@@ -6,6 +6,7 @@
 import { NextResponse, type NextRequest } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { z } from 'zod'
+import { resolveExampleInput } from '@/features/agents/utils/resolveExampleInput'
 
 const discoverSchema = z.object({
   category:   z.string().optional(),
@@ -28,15 +29,36 @@ export async function GET(request: NextRequest) {
   const { category, max_price, capability, limit } = parsed.data
   const supabase = await createClient()
 
-  // WAS-160e: Use RPC function with on-chain boost ordering
-  const { data: agents, error } = await supabase.rpc('discover_agents_v2', {
-    p_category:  category ?? null,
-    p_max_price: max_price ?? null,
-    p_limit:     limit,
-  })
+  const CORS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  }
 
-  if (error) {
-    return NextResponse.json({ error: 'Discovery failed' }, { status: 500 })
+  // WAS-160e: Use RPC function with on-chain boost ordering
+  let agents
+  try {
+    const { data, error } = await supabase.rpc('discover_agents_v2', {
+      p_category:  category ?? null,
+      p_max_price: max_price ?? null,
+      p_limit:     limit,
+    })
+
+    if (error) {
+      console.error('[agents/discover] Supabase RPC error:', error.message)
+      return NextResponse.json(
+        { error: 'internal_error', message: 'Service temporarily unavailable' },
+        { status: 503, headers: CORS }
+      )
+    }
+
+    agents = data
+  } catch (err) {
+    console.error('[agents/discover] Unexpected error:', err)
+    return NextResponse.json(
+      { error: 'internal_error', message: 'Service temporarily unavailable' },
+      { status: 503, headers: CORS }
+    )
   }
 
   // Client-side filter by capability name (capabilities is JSONB array)
@@ -49,8 +71,13 @@ export async function GET(request: NextRequest) {
     })
   }
 
+  const agentsWithExample = filtered.map((a: Record<string, unknown>) => ({
+    ...a,
+    example_input: resolveExampleInput(a as Parameters<typeof resolveExampleInput>[0]),
+  }))
+
   return NextResponse.json({
-    agents: filtered,
+    agents: agentsWithExample,
     total: filtered.length,
     meta: {
       invoke_endpoint: '/api/v1/models/{slug}/invoke',
@@ -58,5 +85,5 @@ export async function GET(request: NextRequest) {
       docs_url: 'https://app.wasiai.io/docs',
       sdk: 'npm install @wasiai/sdk',
     },
-  })
+  }, { headers: CORS })
 }

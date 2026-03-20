@@ -11,7 +11,10 @@ export interface AgentKey {
   is_active: boolean
   last_used_at: string | null
   created_at: string
+  balance_synced_at: string | null
   owner_wallet_address?: string | null   // HU-058: first depositor's wallet
+  allowed_slugs: string[] | null
+  allowed_categories: string[] | null
   // Only returned on creation
   raw_key?: string
 }
@@ -37,10 +40,32 @@ export async function getAgentKeys(): Promise<AgentKey[]> {
   return (data as AgentKey[]) ?? []
 }
 
-export async function createAgentKey(name: string, budgetUsdc: number): Promise<AgentKey> {
+export async function createAgentKey(
+  name: string,
+  budgetUsdc: number,
+  options?: { allowed_slugs?: string[], allowed_categories?: string[] }
+): Promise<AgentKey> {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) throw new Error('Unauthorized')
+
+  if (options?.allowed_slugs && options.allowed_slugs.length > 0) {
+    const { data: foundAgents } = await supabase
+      .from('agents')
+      .select('slug')
+      .in('slug', options.allowed_slugs)
+      .eq('status', 'active')
+
+    const foundSlugs = new Set((foundAgents ?? []).map((a: {slug: string}) => a.slug))
+    const invalidSlugs = options.allowed_slugs.filter(s => !foundSlugs.has(s))
+
+    if (invalidSlugs.length > 0) {
+      throw Object.assign(
+        new Error(`Slugs no encontrados: ${invalidSlugs.join(', ')}`),
+        { code: 'invalid_slugs', status: 422, invalidSlugs }
+      )
+    }
+  }
 
   const { raw, hash } = generateApiKey()
 
@@ -51,6 +76,8 @@ export async function createAgentKey(name: string, budgetUsdc: number): Promise<
       name,
       key_hash: hash,
       budget_usdc: budgetUsdc,
+      allowed_slugs: options?.allowed_slugs ?? null,
+      allowed_categories: options?.allowed_categories ?? null,
     })
     .select()
     .single()
@@ -85,7 +112,7 @@ export async function validateAgentKey(rawKey: string): Promise<AgentKey | null>
   if (!data) return null
 
   const key = data as AgentKey
-  if (key.spent_usdc >= key.budget_usdc) return null // Budget exhausted
+  if (key.budget_usdc <= 0) return null // on-chain balance is 0 or negative = exhausted
 
   return key
 }

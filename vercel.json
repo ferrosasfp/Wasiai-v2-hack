@@ -1,0 +1,16 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/settle-key-batches",
+      "schedule": "0 2 * * *"
+    },
+    {
+      "path": "/api/cron/reconcile-onchain",
+      "schedule": "0 3 * * *"
+    },
+    {
+      "path": "/api/cron/reputation-batch",
+      "schedule": "0 4 * * *"
+    }
+  ]
+}

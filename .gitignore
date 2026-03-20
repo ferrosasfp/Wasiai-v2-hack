@@ -5,3 +5,7 @@ node_modules/
 .vercel
 *.tsbuildinfo
 test-results/
+contracts/broadcast/
+contracts/cache/
+contracts/lib/
+contracts/out/

@@ -5,6 +5,7 @@ import { mcpRequestSchema } from '@/lib/schemas/api.schemas'
 import { validateEndpointUrlAsync } from '@/lib/security/validateEndpointUrl'
 import { logger } from '@/lib/logger'
 import { getInvokeLimit, checkRateLimit } from '@/lib/ratelimit'
+import { assertPaymentType } from '@/lib/validation/payment-type'
 
 /**
  * WasiAI MCP Server Endpoint
@@ -40,6 +41,8 @@ async function callUpstreamMcp(
   endpointUrl: string,
   input: string,
   options?: Record<string, unknown>,
+  webhookSecret?: string | null,
+  agentId?: string,
 ): Promise<{ data: unknown; status: 'success' | 'error'; latencyMs: number }> {
   // SEC-01 + NG-005: validate endpoint to prevent SSRF (async version includes DNS probe)
   try {
@@ -52,9 +55,15 @@ async function callUpstreamMcp(
   try {
     const upstream = await fetch(endpointUrl, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(webhookSecret && agentId ? {
+          'Authorization': `Bearer ${webhookSecret}`,
+          'X-WasiAI-Agent-Id': agentId,
+        } : (logger.warn('[mcp] agent missing webhook_secret or agentId', { endpointUrl }), {})),
+      },
       body: JSON.stringify({ input, ...(options ?? {}) }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(55_000), // aumentado de 10s — agentes externos (wasiai-agents) tardan más en cold start
     })
     const data = upstream.ok ? await upstream.json() : { error: `Upstream ${upstream.status}` }
     return { data, status: upstream.ok ? 'success' : 'error', latencyMs: Date.now() - startMs }
@@ -204,7 +213,7 @@ export async function POST(request: NextRequest) {
     const keyHash = createHash('sha256').update(rawKey).digest('hex')
 
     const [{ data: model, error: modelError }, { data: keyRow }] = await Promise.all([
-      supabase.from('agents').select('*').eq('slug', slug).eq('status', 'active').single(),
+      supabase.from('agents').select('id, slug, name, description, category, price_per_call, endpoint_url, webhook_secret, status').eq('slug', slug).eq('status', 'active').single(),
       supabase
         .from('agent_keys')
         .select('id, is_active, budget_usdc, spent_usdc')
@@ -235,10 +244,11 @@ export async function POST(request: NextRequest) {
     }
 
     // 5. Call the agent
-    const result = await callUpstreamMcp(model.endpoint_url as string, input, options)
+    const result = await callUpstreamMcp(model.endpoint_url as string, input, options, model.webhook_secret as string | null, model.id as string)
 
     // 6. Deduct budget + log call (fire-and-forget safe — non-critical path)
     if (result.status === 'success') {
+      assertPaymentType('api_key')
       await Promise.all([
         // NG-008: Atomic check+deduct — reemplaza increment_agent_key_spend
         supabase.rpc('check_and_deduct_budget', {
@@ -257,6 +267,8 @@ export async function POST(request: NextRequest) {
           tx_hash: null,
           status: 'success',
           latency_ms: result.latencyMs,
+          payment_type: 'api_key',
+          agent_slug: model.slug,
         }),
       ])
     }

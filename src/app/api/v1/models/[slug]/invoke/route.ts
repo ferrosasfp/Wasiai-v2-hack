@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createHash } from 'crypto'
 import { createClient, createServiceClient } from '@/lib/supabase/server'
 const X402_CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'Content-Type, X-PAYMENT, PAYMENT-SIGNATURE, Authorization',
   'Access-Control-Expose-Headers': 'X-PAYMENT-RESPONSE, PAYMENT-RESPONSE, PAYMENT-REQUIRED',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -9,7 +10,7 @@ const X402_CORS_HEADERS = {
 import { keyHashToBytes32 } from '@/lib/contracts/marketplaceClient'
 import { signReceipt } from '@/lib/receipts/signReceipt'
 import { settlePaymentDirectly, type X402EVMPayload } from '@/lib/contracts/usdcSettler'
-import { validateEndpointUrl } from '@/lib/security/validateEndpointUrl'
+import { validateEndpointUrlAsync } from '@/lib/security/validateEndpointUrl'
 import { getState, wrapWithCircuitBreaker } from '@/lib/circuit-breaker/CircuitBreaker'
 import { retryWithBackoff } from '@/lib/circuit-breaker/retryWithBackoff'
 import { getInvokeLimit, getIdentifier, checkRateLimit, checkCreatorRateLimits, getSharedRedis } from '@/lib/ratelimit'
@@ -29,6 +30,9 @@ const USDC_ADDR  = CHAIN_ID_NUM === 43114
   : '0x5425890298aed601595a70AB815c96711a31Bc65'   // Avalanche Fuji USDC (Circle test token)
 
 import { SITE_URL } from '@/lib/constants'
+import { isAgentInScope } from '@/lib/scope-check'
+import { validateInput } from '@/lib/schema-validator'
+import { assertPaymentType } from '@/lib/validation/payment-type'
 
 /**
  * Build x402 payment requirements manually.
@@ -160,7 +164,7 @@ export async function POST(
     keyHash
       ? supabase
           .from('agent_keys')
-          .select('id, key_hash, is_active, budget_usdc, spent_usdc')
+          .select('id, key_hash, is_active, budget_usdc, spent_usdc, allowed_slugs, allowed_categories')
           .eq('key_hash', keyHash)
           .eq('is_active', true)
           .single()
@@ -233,6 +237,30 @@ export async function POST(
       )
     }
 
+    // WAS-186: Scope check — BEFORE any payment processing
+    // AC3: empty array [] = no access (explicit early return)
+    const hasSlugScope     = Array.isArray(keyRow.allowed_slugs)      && keyRow.allowed_slugs.length > 0
+    const hasCategoryScope = Array.isArray(keyRow.allowed_categories) && keyRow.allowed_categories.length > 0
+    const isEmptyScope     = (keyRow.allowed_slugs !== null      && !hasSlugScope)
+                          || (keyRow.allowed_categories !== null && !hasCategoryScope)
+
+    if (isEmptyScope) {
+      return NextResponse.json(
+        { error: 'Agent not in scope', code: 'agent_not_in_scope' },
+        { status: 403 },
+      )
+    }
+
+    const slugsForCheck      = hasSlugScope     ? keyRow.allowed_slugs      : null
+    const categoriesForCheck = hasCategoryScope ? keyRow.allowed_categories : null
+
+    if (!isAgentInScope(slug, model.category, slugsForCheck, categoriesForCheck)) {
+      return NextResponse.json(
+        { error: 'Agent not in scope', code: 'agent_not_in_scope' },
+        { status: 403 },
+      )
+    }
+
     // NA-203: Redis mutex per-key — prevents concurrent double-spend from same key
     // (on-chain nonce is the stronger fix, but this prevents backend races without re-deploy)
     let keyMutexAcquired = false
@@ -282,6 +310,24 @@ export async function POST(
       )
     }
 
+    // WAS-200 (moved): Validate input AFTER auth — prevent schema info leak to unauthed callers
+    if (model.input_schema) {
+      let inputVal: unknown
+      try {
+        const rawBody = await request.clone().json()
+        inputVal = rawBody.input ?? rawBody
+      } catch {
+        return NextResponse.json({ error: 'Invalid JSON body', code: 'invalid_body' }, { status: 400 })
+      }
+      const validErr = validateInput(model.input_schema as Record<string, unknown>, inputVal)
+      if (validErr) {
+        return NextResponse.json(
+          { error: 'Input validation failed', code: 'input_invalid', details: [validErr] },
+          { status: 422 },
+        )
+      }
+    }
+
     const result = await callUpstream(model, request, slug)
 
     // Track receipt signature (non-fatal if it fails)
@@ -290,7 +336,8 @@ export async function POST(
 
     if (result.status === 'success') {
       // 1. Log call to DB first to get the call ID
-      const { id: insertedId } = await logCall(supabase, model, 'agent', null, null, result, keyRow.id, slug)
+      assertPaymentType('api_key')
+      const { id: insertedId } = await logCall(supabase, model, 'agent', null, null, result, keyRow.id, slug, null, 'api_key')
       callId = insertedId ?? null
       // HAL-027: Mismo timestamp para receipt y called_at — auditoría consistente
       const receiptTimestamp = Math.floor(Date.now() / 1000)
@@ -333,8 +380,10 @@ export async function POST(
         // La llamada ya fue exitosa — logearla sin cobro para auditoría
       }
     } else {
-      // Log failed call (no receipt needed)
-      await logCall(supabase, model, 'agent', null, null, result, keyRow.id, slug)
+      // Log failed call (no receipt needed) — capture id for call_id exposure
+      assertPaymentType('api_key')
+      const { id: errCallId } = await logCall(supabase, model, 'agent', null, null, result, keyRow.id, slug, null, 'api_key')
+      callId = errCallId ?? null
     }
 
     // WAS-74: Fire-and-forget webhook trigger — never await, never blocks TTFB
@@ -356,7 +405,7 @@ export async function POST(
       try { await getSharedRedis().del(mutexKey) } catch { /* non-fatal */ }
     }
 
-    return buildResponse(model, result, undefined, receiptSignature ?? undefined, { creatorPrice, overhead, totalPrice, breakdown })
+    return buildResponse(model, result, undefined, receiptSignature ?? undefined, { creatorPrice, overhead, totalPrice, breakdown }, callId ?? undefined)
   }
 
   // ── 3. Route B: x402 Payment (WasiAI-native settlement) ────────────────
@@ -366,16 +415,34 @@ export async function POST(
 
   if (!paymentHeader) {
     // No payment — return 402 with x402 payment instructions
+    logger.info('[x402] probe', { slug, ip: getIdentifier(request) })
     return build402Instructions(model, priceStr, resourceUrl)
   }
 
   // ── 5. Verify + Settle (Route B) ───────────────────────────────────────
+  const settleStart = Date.now()
   const settlementOrError = await settleX402(paymentHeader, model, priceStr)
 
   // If helper returned a NextResponse (error), return it directly
-  if (settlementOrError instanceof NextResponse) return settlementOrError
+  if (settlementOrError instanceof NextResponse) {
+    logger.info('[x402] settle_result', {
+      slug,
+      verified: false,
+      settled: false,
+      latency_ms: Date.now() - settleStart,
+      error: 'payment_invalid',
+    })
+    return settlementOrError
+  }
 
   const settlement = settlementOrError as SettlementResult
+  logger.info('[x402] settle_result', {
+    slug,
+    verified: settlement.verified ?? false,
+    settled: settlement.settled ?? false,
+    latency_ms: Date.now() - settleStart,
+    error: settlement.error ?? null,
+  })
 
   if (!settlement.verified) {
     logger.error('[invoke] payment verification failed', settlement)
@@ -393,9 +460,68 @@ export async function POST(
     )
   }
 
-  // ── 6. Payment valid — call the upstream model ────────────────────────────
+  // ── 6. Payment valid — validate input then call upstream ─────────────────
+  // WAS-200 (moved): Validate input AFTER payment auth — prevent schema info leak
+  if (model.input_schema) {
+    let inputVal: unknown
+    try {
+      const rawBody = await request.clone().json()
+      inputVal = rawBody.input ?? rawBody
+    } catch {
+      return NextResponse.json({ error: 'Invalid JSON body', code: 'invalid_body' }, { status: 400 })
+    }
+    const validErr = validateInput(model.input_schema as Record<string, unknown>, inputVal)
+    if (validErr) {
+      return NextResponse.json(
+        { error: 'Input validation failed', code: 'input_invalid', details: [validErr] },
+        { status: 422 },
+      )
+    }
+  }
+
   const result = await callUpstream(model, request, slug)
-  await logCall(supabase, model, 'human', null, settlement.transactionHash ?? null, result, null, slug)
+  logger.info('[x402] upstream_result', {
+    slug,
+    status: result.status,
+    latency_ms: result.latencyMs,
+    charged: result.status === 'success',
+  })
+  // WAS-132: Extract EIP-3009 nonce from payment authorization for idempotency
+  const x402Nonce = (paymentHeader?.payload as X402EVMPayload | undefined)
+    ?.authorization?.nonce ?? null
+
+  assertPaymentType('x402')
+  const logResult = await logCall(supabase, model, 'human', null, settlement.transactionHash ?? null, result, null, slug, x402Nonce, 'x402')
+  // WAS-132: Unique constraint violation on nonce = replay attack — return 402
+  if (logResult.error?.code === 'payment_already_used') {
+    return NextResponse.json(
+      { error: 'payment_already_used', code: 'payment_already_used' },
+      { status: 402 },
+    )
+  }
+  const callId = logResult.id
+
+  // S6-01: Fire-and-forget — registrar failure "cobro sin servicio"
+  if (settlement.settled && result.status !== 'success') {
+    void Promise.resolve(
+      supabase.from('settlement_failures').insert({
+        settlement_tx_hash: settlement.transactionHash ?? 'unknown',
+        agent_slug: slug,
+        amount_usdc: model.price_per_call,
+        caller_wallet: null,
+        error_reason: (typeof result.data === 'string' ? result.data : JSON.stringify(result.data ?? 'upstream_error')).slice(0, 500),
+        agent_call_id: callId ?? null,
+      })
+    ).then((res) => {
+      if (res.error) {
+        logger.error('[invoke] settlement_failure insert DB error', { err: res.error.message, txHash: settlement.transactionHash })
+      } else {
+        logger.warn('[invoke] settlement_failure recorded', { slug, txHash: settlement.transactionHash })
+      }
+    }).catch((err: unknown) => {
+      logger.error('[invoke] settlement_failure insert failed', { err: String(err).slice(0, 200), txHash: settlement.transactionHash })
+    })
+  }
 
   // WAS-74: Fire-and-forget webhook trigger — never await, never blocks TTFB
   if (model.creator_id) {
@@ -421,7 +547,7 @@ export async function POST(
     ).catch((err: unknown) => logger.error('[invoke] increment_pending_earnings failed', { err }))
   }
 
-  return buildResponse(model, result, settlement.transactionHash, undefined, { creatorPrice, overhead, totalPrice, breakdown })
+  return buildResponse(model, result, settlement.transactionHash, undefined, { creatorPrice, overhead, totalPrice, breakdown }, callId ?? undefined)
   } catch (err) {
     logger.error('[invoke] unhandled error', { err })
     // S-10: Never expose raw error details in production
@@ -481,7 +607,7 @@ async function callUpstream(model: Record<string, unknown>, request: NextRequest
 
   // SEC-01: Validate endpoint URL to prevent SSRF
   try {
-    validateEndpointUrl(model.endpoint_url as string)
+    await validateEndpointUrlAsync(model.endpoint_url as string)
   } catch (err) {
     return { data: { error: 'Invalid model endpoint', detail: String(err) }, status: 'error' as const, latencyMs: 0 }
   }
@@ -501,7 +627,13 @@ async function callUpstream(model: Record<string, unknown>, request: NextRequest
         const res = await retryWithBackoff(
           () => fetch(model.endpoint_url as string, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...((model.webhook_secret as string | null) ? {
+                'Authorization': `Bearer ${model.webhook_secret}`,
+                'X-WasiAI-Agent-Id': model.id as string,
+              } : {}),
+            },
             body: JSON.stringify(body),
             signal: AbortSignal.timeout(10_000), // PERF-02: 10s max, no infinite hangs
           })
@@ -532,7 +664,9 @@ async function logCall(
   result: { status: string; latencyMs: number },
   keyId?: string | null,
   agentSlug?: string | null,
-): Promise<{ id?: string }> {
+  nonce?: string | null,
+  paymentType?: string,
+): Promise<{ id?: string; error?: { code: string } }> {
   // PERF-06: supabase is already resolved — no redundant await
   const [insertResult] = await Promise.all([
     supabase.from('agent_calls').insert({
@@ -545,6 +679,8 @@ async function logCall(
       latency_ms:      result.latencyMs,
       key_id:          keyId ?? null,
       agent_slug:      agentSlug ?? null,
+      nonce:           nonce ?? null,
+      payment_type:    paymentType ?? 'unknown',
     }).select('id').single(),
     result.status === 'success'
       ? supabase.rpc('increment_agent_stats', {
@@ -553,6 +689,10 @@ async function logCall(
         })
       : Promise.resolve(),
   ])
+  // WAS-132: 23505 = unique_violation on nonce index — replay attack detected
+  if (insertResult.error && (insertResult.error as { code?: string }).code === '23505') {
+    return { error: { code: 'payment_already_used' } }
+  }
   // HAL-021: callId viene directamente del insert (no de búsqueda posterior)
   // Esto previene race conditions donde dos llamadas concurrentes podrían
   // obtener el mismo callId si se buscara por ORDER BY called_at DESC LIMIT 1
@@ -572,6 +712,7 @@ function buildResponse(
   txHash?: string,
   receiptSignature?: string,
   pricingInfo?: PricingInfo,
+  callId?: string,
 ) {
   return NextResponse.json(
     {
@@ -589,6 +730,7 @@ function buildResponse(
         chain: CHAIN_NAME,
         tx_hash: txHash ?? null,
         status: result.status,
+        call_id: callId ?? undefined,
       },
       // Cryptographic receipt — lets the caller audit that this call was real.
       // Verify with: verifyReceipt(receipt, signature) from @/lib/receipts/signReceipt
@@ -607,4 +749,8 @@ function buildResponse(
     },
     { headers: X402_CORS_HEADERS },
   )
+}
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: X402_CORS_HEADERS })
 }
